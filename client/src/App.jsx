@@ -1,6 +1,6 @@
 import "./App.css";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 const getSessionId = () => {
 
@@ -22,7 +22,9 @@ const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:5000").replac
 
 function App() {
 
-  const [sessionId] = useState(getSessionId);
+  const [sessionId, setSessionId] = useState(getSessionId);
+
+  const chatRequest = useRef(null);
 
   const [input, setInput] = useState("");
 
@@ -94,11 +96,29 @@ function App() {
 
   });
 
+  const newChat = () => {
+    // Cancel any old reply so it cannot appear in the new conversation.
+    if (chatRequest.current) {
+      chatRequest.current.abort();
+      chatRequest.current = null;
+    }
+
+    const newSessionId = crypto.randomUUID();
+    localStorage.setItem("leadflow-session", newSessionId);
+    setSessionId(newSessionId);
+    setMessages([]);
+    setInput("");
+    setError("");
+    setChatLoading(false);
+  };
+
   const sendMessage = async () => {
 
     if (!input.trim() || chatLoading) return;
 
     const currentInput = input;
+    const controller = new AbortController();
+    chatRequest.current = controller;
 
     setMessages((old) => [...old, `Du: ${currentInput}`]);
 
@@ -111,6 +131,7 @@ function App() {
     try {
 
       const response = await fetch(`${API_URL}/message`, {
+        signal: controller.signal,
 
         method: "POST",
 
@@ -138,17 +159,23 @@ function App() {
 
       const data = await response.text();
 
-      setMessages((old) => [...old, data]);
+      if (!controller.signal.aborted) {
+        setMessages((old) => [...old, data]);
+      }
 
     } catch (err) {
 
-      console.error(err);
-
-      setError("Could not send message.");
+      if (err.name !== "AbortError" && !controller.signal.aborted) {
+        console.error(err);
+        setError("Could not send message.");
+      }
 
     } finally {
 
-      setChatLoading(false);
+      if (chatRequest.current === controller) {
+        chatRequest.current = null;
+        setChatLoading(false);
+      }
 
     }
 
@@ -447,6 +474,10 @@ function App() {
         <div className="chat-section">
 
           <h2>AI Chat</h2>
+
+          <button type="button" onClick={newChat}>
+            New Chat
+          </button>
 
           {chatLoading && <p>AI is thinking...</p>}
 

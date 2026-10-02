@@ -8,14 +8,27 @@ const Conversation = require("./models/Conversation");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const { rateLimit } = require("express-rate-limit");
-const { correctedService, bareCorrectedName, normalize, isValidEmail, emailFrom, customerSaid, explicitName, correctionField, isConfirmation, hasAllFields, isSwedish } = require("./leadstate");
+const { handleChatMessage } = require("./chatflow");
+const { createInterpreter } = require("./interpreter");
+const { withSessionLock } = require("./sessionLock");
 
 require("dotenv").config();
 
 const app = express();
+app.set("trust proxy", 1);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-app.use(cors());
+const allowedOrigins = [
+  "https://lead-flow-ai-weld.vercel.app",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+];
+
+app.use(
+  cors({
+    origin: allowedOrigins,
+  })
+);
 app.use(express.json({ limit: "10kb" }));
 
 const PORT = process.env.PORT || 5000;
@@ -125,242 +138,50 @@ app.delete("/leads/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// CHAT AND CUSTOMER DATA
-// A lead is only written after the customer confirms all three fields.
-// Draft and correction status live in MongoDB, independently of the AI transcript.
+// Chat. The AI model only interprets what the customer wrote (interpreter.js).
+// The backend owns the state and decides the next question and when to save
+// (chatflow.js + leadstate.js). Set LEADFLOW_DEBUG=true for diagnostic logs
+// that never contain customer names, emails or messages.
+const chatDeps = {
+  company,
+  interpret: createInterpreter({ openai, company }),
+  leads: {
+    findById: (id) => Lead.findById(id),
+    findDuplicateEmail: (email, excludeId) =>
+      Lead.findOne({ email, ...(excludeId ? { _id: { $ne: excludeId } } : {}) }),
+    create: (data) => new Lead(data).save(),
+    update: async (lead, data) => {
+      lead.name = data.name;
+      lead.email = data.email;
+      lead.service = data.service;
+      return lead.save();
+    },
+  },
+  log: (event, data) => {
+    if (process.env.LEADFLOW_DEBUG === "true") console.log("LeadFlow", event, data);
+  },
+};
+
 app.post("/message", chatLimiter, async (req, res) => {
   try {
     const { message, sessionId } = req.body || {};
-    if (
-      typeof sessionId !== "string" || !sessionId.trim() || sessionId.length > 100 ||
-      typeof message !== "string" || !message.trim() || message.length > 2000
-    ) {
+    if (typeof sessionId !== "string" || !sessionId.trim() || sessionId.length > 100 ||
+        typeof message !== "string" || !message.trim() || message.length > 2000) {
       return res.status(400).send("Valid message and session ID are required");
     }
 
-    const userMessage = message.trim();
-    let conversation = await Conversation.findOne({ sessionId });
-    if (!conversation) conversation = new Conversation({ sessionId, messages: [] });
-    if (conversation.messages.length >= 40) {
-      return res.status(400).send("Den här konversationen är full. Starta en ny chatt.");
-    }
-
-    const draft = {
-      name: conversation.leadDraft?.name || "",
-      email: conversation.leadDraft?.email || "",
-      service: conversation.leadDraft?.service || "",
-    };
-    const swedish = isSwedish([...conversation.messages, { role: "user", content: userMessage }]);
-    const say = (sv, en) => swedish ? sv : en;
-    const reply = async (text) => {
-      conversation.messages.push({ role: "assistant", content: text });
+    // One message at a time per chat, so two quick messages cannot overwrite each other.
+    const outcome = await withSessionLock(sessionId, async () => {
+      let conversation = await Conversation.findOne({ sessionId });
+      if (!conversation) conversation = new Conversation({ sessionId, messages: [] });
+      if (conversation.messages.length >= 40) {
+        return { status: 400, text: "Den här konversationen är full. Starta en ny chatt." };
+      }
+      const { reply } = await handleChatMessage({ conversation, message, deps: chatDeps });
       await conversation.save();
-      return res.send(`AI: ${text}`);
-    };
-
-    // Accept an explicit yes ONLY after we have shown the complete draft.
-    // A correction invalidates that confirmation immediately.
-    const rawCorrection = correctionField(userMessage);
-    const correction = rawCorrection === "unknown" && !conversation.awaitingConfirmation && !conversation.pendingCorrection ? "" : rawCorrection;
-    const originalDraft = { ...draft };
-    const hadPendingCorrection = Boolean(conversation.pendingCorrection);
-    const wasAwaitingConfirmation = conversation.awaitingConfirmation;
-    conversation.messages.push({ role: "user", content: userMessage });
-
-    if (correction) {
-      conversation.awaitingConfirmation = false;
-      conversation.pendingCorrection = correction;
-      if (correction !== "unknown") draft[correction] = "";
-    }
-
-    if (!correction && !hadPendingCorrection && wasAwaitingConfirmation && isConfirmation(userMessage)) {
-      if (!hasAllFields(draft)) {
-        conversation.awaitingConfirmation = false;
-        await conversation.save();
-        return reply(say("Någon uppgift saknas. Vi behöver kontrollera dem igen.", "Some information is missing. Let's verify it again."));
-      }
-      // Update a lead created by THIS conversation if the customer later corrected it.
-      // Never rewrite another customer's lead based only on a matching email.
-      let lead = conversation.leadId ? await Lead.findById(conversation.leadId) : null;
-      if (lead) {
-        const collision = await Lead.findOne({ email: draft.email, _id: { $ne: lead._id } });
-        if (collision) {
-          conversation.awaitingConfirmation = false;
-          await conversation.save();
-          return reply(say("Den här mejladressen finns redan registrerad. Kontakta oss om du behöver hjälp.",
-            "This email address is already registered. Contact us if you need help."));
-        }
-        lead.name = draft.name;
-        lead.email = draft.email;
-        lead.service = draft.service;
-        await lead.save();
-      } else {
-        lead = await Lead.findOne({ email: draft.email });
-        if (!lead) lead = await new Lead(draft).save();
-        // Do not take ownership of another conversation's lead.
-        else {
-          conversation.awaitingConfirmation = false;
-          await conversation.save();
-          return reply(say("Den här mejladressen finns redan registrerad. Kontakta oss om du behöver hjälp.",
-            "This email address is already registered. Contact us if you need help."));
-        }
-      }
-      if (lead) conversation.leadId = lead._id;
-      conversation.awaitingConfirmation = false;
-      await conversation.save();
-      return reply(say("Tack! Dina uppgifter är mottagna.", "Thanks! Your details have been received."));
-    }
-
-    if (correction === "unknown") {
-      conversation.leadDraft = draft;
-      await conversation.save();
-      return reply(say("Vilken uppgift vill du ändra: namn, mejladress eller tjänst?",
-        "Which detail would you like to change: name, email or service?"));
-    }
-
-    if (conversation.pendingCorrection === "unknown") {
-      // Do not proceed until we know which previous value must be invalidated.
-      const declared = /namn|name/i.test(userMessage) ? "name" :
-        /mejl|mail|e-post|email/i.test(userMessage) ? "email" :
-        /tjänst|service/i.test(userMessage) ? "service" : "";
-      if (!declared) {
-        await conversation.save();
-        return reply(say("Skriv vilken uppgift som är fel: namn, mejladress eller tjänst.",
-          "Please tell me which detail is wrong: name, email or service."));
-      }
-      conversation.pendingCorrection = declared;
-      draft[declared] = "";
-    }
-
-    // Capture a newly supplied email even if we are still waiting for a corrected name.
-    const suppliedEmail = emailFrom(userMessage);
-    if (suppliedEmail && correction !== "email" && conversation.pendingCorrection !== "email") {
-      draft.email = suppliedEmail;
-    }
-
-    // During a correction, a previous AI guess cannot restore the invalidated field.
-    if (conversation.pendingCorrection === "name") {
-      const newName = bareCorrectedName(userMessage) || explicitName(userMessage);
-      if (!newName) {
-        conversation.leadDraft = draft;
-        await conversation.save();
-        return reply(say("Vad heter du egentligen? Skriv gärna: Jag heter [ditt namn].",
-          "What is your correct name? Please write: My name is [your name]."));
-      }
-      draft.name = newName;
-      conversation.pendingCorrection = "";
-    } else if (conversation.pendingCorrection === "email") {
-      const newEmail = emailFrom(userMessage);
-      if (!newEmail) {
-        conversation.leadDraft = draft;
-        await conversation.save();
-        return reply(say("Skriv din rätta, fullständiga mejladress.", "Please enter your correct, complete email address."));
-      }
-      draft.email = newEmail;
-      conversation.pendingCorrection = "";
-    } else if (conversation.pendingCorrection === "service") {
-      // Read the new service from this message. Do not reuse the old service.
-      const newService = correctedService(userMessage, hadPendingCorrection && !correction);
-      if (!newService) {
-        conversation.leadDraft = draft;
-        await conversation.save();
-        return reply(say("Vilken tjänst vill du ha? Skriv gärna: Jag vill ha [tjänst].",
-          "Which service do you want? Please write: I want [service]."));
-      }
-      draft.service = newService;
-      conversation.pendingCorrection = "";
-    }
-
-    // A valid address must actually be present in a CUSTOMER message, never
-    // copied from company.email or hallucinated by the language model.
-    conversation.leadDraft = draft;
-    conversation.awaitingConfirmation = false;
-    await conversation.save();
-
-    const response = await openai.responses.create({
-      model: "gpt-5.4-mini",
-      instructions: `
-        You are LeadFlow AI, customer support and sales assistant for ${company.name}.
-        COMPANY: ${company.description}
-        SERVICES: ${company.services.join(", ")}
-        BUSINESS EMAIL (NOT the customer's email): ${company.email}
-        HOURS: ${company.openingHours}
-
-        Reply briefly in the customer's language. Only state supported company facts.
-        Never promise an employee will get in touch. Never call the company email a customer email.
-        Gather missing customer name, valid email and service naturally, asking one question at a time.
-        The backend, not you, decides when a lead is saved and when confirmation is required.
-        Previously corrected details must not be reused.
-        CURRENT VERIFIED CUSTOMER DRAFT (empty means not yet verified): ${JSON.stringify(draft)}.
-        You may suggest NEW information in customer fields below, including partial information.
-        Only propose information actually stated in the customer's own messages.
-        Prefer the most recent customer correction. An email must include @ and a real domain format.
-        If a detail remains unknown, return null for it. Do NOT infer from company details or assistant replies.
-      `,
-      input: conversation.messages.map(m => ({ role: m.role, content: m.content })),
-      text: {
-        format: {
-          type: "json_schema",
-          name: "customer_response",
-          strict: true,
-          schema: {
-            type: "object",
-            properties: {
-              reply: { type: "string" },
-              customer: {
-                type: "object",
-                properties: {
-                  name: { type: ["string", "null"] },
-                  email: { type: ["string", "null"] },
-                  service: { type: ["string", "null"] },
-                },
-                required: ["name", "email", "service"],
-                additionalProperties: false,
-              },
-            },
-            required: ["reply", "customer"],
-            additionalProperties: false,
-          },
-        },
-      },
+      return { status: 200, text: `AI: ${reply}` };
     });
-
-    const result = JSON.parse(response.output_text);
-    const candidate = result.customer || {};
-    const proposedName = typeof candidate.name === "string" ? candidate.name.trim() : "";
-    const proposedService = typeof candidate.service === "string" ? candidate.service.trim() : "";
-
-    if (!draft.name && proposedName.length >= 2 && proposedName.length <= 80 &&
-        !/@/.test(proposedName) && customerSaid(conversation.messages, proposedName) &&
-        !correction && !hadPendingCorrection) {
-      draft.name = proposedName;
-    }
-
-    if (!draft.service && proposedService.length <= 100 && proposedService &&
-        customerSaid(conversation.messages, proposedService) &&
-        !correction && !hadPendingCorrection) {
-      draft.service = proposedService;
-    }
-
-    // Preserve a corrected name/service we explicitly extracted above, even
-    // if the model still suggests a stale one from earlier in the transcript.
-    conversation.leadDraft = draft;
-
-    if (hasAllFields(draft) && !conversation.pendingCorrection &&
-        (!conversation.leadId || ["name", "email", "service"].some(k => draft[k] !== originalDraft[k]) || correction || hadPendingCorrection)) {
-      conversation.awaitingConfirmation = true;
-      await conversation.save();
-      return reply(say(
-        `Stämmer följande uppgifter: namn ${draft.name}, mejladress ${draft.email}, tjänst ${draft.service}? Svara ja eller berätta vad som ska ändras.`,
-        `Are these details correct: name ${draft.name}, email ${draft.email}, service ${draft.service}? Reply yes or tell me what to correct.`
-      ));
-    }
-
-    await conversation.save();
-    if (!draft.service) return reply(result.reply || say("Vad kan vi hjälpa dig med?", "What can we help you with?"));
-    if (!draft.name) return reply(say("Vad heter du?", "What's your name?"));
-    if (!draft.email) return reply(say("Vad är din fullständiga mejladress?", "What's your full email address?"));
-    return reply(result.reply);
+    return res.status(outcome.status).send(outcome.text);
   } catch (error) {
     console.error("Chat error:", error);
     return res.status(500).send("AI: Något gick fel.");

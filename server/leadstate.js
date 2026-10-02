@@ -1,70 +1,112 @@
-// Testable helpers for extracting and validating customer-owned information.
-const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
-const VALID_EMAIL = /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i;
-const normalize = (text) => String(text || "").normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
-const isValidEmail = (value) => typeof value === "string" && value.length <= 254 && VALID_EMAIL.test(value);
-const emailFrom = (text) => {
-  const match = String(text).match(EMAIL_PATTERN);
-  return match && isValidEmail(match[0]) ? match[0].toLowerCase() : "";
+"use strict";
+
+// Pure helpers: no database, no network, no model calls.
+// The AI model only PROPOSES changes. This file decides what is accepted.
+// Rules of the design:
+//   * name and email must literally appear in the customer's LATEST message
+//   * service must be one of the services configured in company.js
+//   * a proposal that repeats a value we already have is ignored, never an error
+//   * a proposal we cannot accept is ignored and reported, never used to wipe data
+
+const FIELDS = ["name", "email", "service"];
+const ASK_ORDER = ["service", "name", "email"];
+
+const normalize = (value) => String(value ?? "")
+  .normalize("NFKC").toLocaleLowerCase().replace(/\s+/g, " ").trim();
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const EMAIL = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
+const isValidEmail = (value) =>
+  typeof value === "string" && value.length <= 254 && EMAIL.test(value);
+
+const NAME = /^[\p{L}][\p{L} '\u2019\-]*$/u;
+const isValidName = (value) =>
+  typeof value === "string" && value.length >= 2 && value.length <= 80 && NAME.test(value);
+
+// Returns the configured spelling of a service, or "" if it is not configured.
+const canonicalService = (value, services = []) =>
+  services.find((service) => normalize(service) === normalize(value)) || "";
+
+const groundedName = (message, proposed) => {
+  if (typeof proposed !== "string") return "";
+  const name = proposed.trim().replace(/\s+/g, " ");
+  if (!isValidName(name)) return "";
+  // Remove e-mail addresses first, so "oskar@lillen.com" cannot "contain" the name "oskar".
+  const source = normalize(String(message).replace(/\S+@\S+/g, " "));
+  const pattern = new RegExp(`(^|[^\\p{L}])${escapeRegExp(normalize(name))}($|[^\\p{L}])`, "u");
+  return pattern.test(source) ? name : "";
 };
-const customerSaid = (messages, value) => {
-  const target = normalize(value);
-  return Boolean(target) && messages.filter(m => m.role === "user")
-    .some(m => normalize(m.content).includes(target));
+
+const groundedEmail = (message, proposed) => {
+  if (typeof proposed !== "string" || !isValidEmail(proposed.trim())) return "";
+  const email = proposed.trim().toLowerCase();
+  const found = String(message).toLowerCase().split(/[\s,;<>()[\]]+/)
+    .some((word) => word.replace(/[.!?]+$/, "") === email);
+  return found ? email : "";
 };
-const explicitName = (text) => {
-  const matches = String(text).trim().matchAll(/(?:jag heter|mitt (?:riktiga )?namn är|namnet är|my name is|call me|heter)\s+([a-zåäöA-ZÅÄÖ][a-zåäöA-ZÅÄÖ '-]{1,55})/gi);
-  for (const match of matches) {
-    const name = match[1].replace(/[.,!?]+$/, "").trim();
-    if (name.length >= 2 && !/\b(inte|not|fel|wrong)\b/i.test(name)) return name;
+
+// First missing/invalid field in the order the backend asks for them, or null.
+// A service that is not in company.js (for example old free-text data) counts as missing.
+const nextMissingField = (draft, services = []) => {
+  for (const field of ASK_ORDER) {
+    if (field === "service" && !canonicalService(draft?.service, services)) return "service";
+    if (field === "name" && !isValidName(draft?.name)) return "name";
+    if (field === "email" && !isValidEmail(draft?.email)) return "email";
   }
-  return "";
+  return null;
 };
 
-// A short self-correction like "eller nej Oskar" contains a corrected name,
-// even though it omits "jag heter". Exclude email/service references.
-const bareCorrectedName = (text) => {
-  const t = String(text || "").trim();
-  const match = t.match(/^(?:eller\s+)?(?:nej|no|sorry|förlåt)[,\s]+(?:(?:asså|alltså|jag menar|actually)[,\s]+)?([A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö '-]{1,55})[.!?]*$/i);
-  if (!match || /^(?:jag|my|mitt|name|heter)\b/i.test(match[1]) || /\b(?:email|e-post|mejl|mail|tjänst|service|är|is|inte|not|fel)\b/i.test(match[1])) return "";
-  return match[1].trim();
-};
+const hasAllFields = (draft, services = []) => nextMissingField(draft, services) === null;
 
-const correctionField = (text) => {
-  const t = normalize(text);
-  if (bareCorrectedName(text) || /^(?:eller\s+)?(?:nej|no|sorry|förlåt|fast|jag menar)[,\s]+(?:jag heter|mitt namn är|my name is|call me)\b/i.test(t)) return "name";
-  if (/(?:namn(?:et)?|heter).{0,25}(?:inte|fel)|(?:inte|fel).{0,25}namn|(?:name).{0,25}(?:wrong|not)|not my name/i.test(t)) return "name";
-  if (/(?:mejl|mail|epost|e-post|email).{0,25}(?:fel|inte|wrong|not)|(?:fel|wrong).{0,25}(?:mejl|mail|email)/i.test(t)) return "email";
-  if (/(?:tjänst|service).{0,25}(?:fel|inte|wrong|not)|(?:fel|wrong).{0,25}(?:tjänst|service)/i.test(t)) return "service";
-  // Direct changes such as "jag vill ändra tjänsten till sociala medier".
-  if (/\b(?:ändra|byta|byt|change|switch)\b.{0,35}\b(?:tjänst(?:en)?|service)\b|\b(?:tjänst(?:en)?|service)\b.{0,25}\b(?:till|instead of|to)\b/i.test(t)) return "service";
-  if (/^(?:nej|no)(?:[.!]?|[, ]+(?:det stämmer inte|that is wrong))[.!?]*$/i.test(t)) return "unknown";
-  return "";
-};
-// Only use a newly stated service, never silently restore the old one.
-const correctedService = (text, allowPlainAnswer = false) => {
-  const value = String(text || "").trim();
-  const patterns = [
-    /(?:ändra|byta|byt)\s+(?:min\s+)?tjänst(?:en)?\s+till\s+(.+)/i,
-    /(?:change|switch)\s+(?:my\s+)?service\s+to\s+(.+)/i,
-    /(?:tjänsten?\s+(?:är|ska vara|blir)|service\s+(?:is|should be))\s+(.+)/i,
-    /(?:jag vill (?:ha|använda)|jag är intresserad av|i want|i'm interested in)\s+(.+)/i,
-  ];
-  for (const pattern of patterns) {
-    const match = value.match(pattern);
-    if (match) {
-      const service = match[1].trim().replace(/[.!?]+$/, "").trim();
-      if (service.length >= 2 && service.length <= 100 && !service.includes("@")) return service;
+const isConfirmation = (value) =>
+  /^(ja|ja det stämmer|ja, det stämmer|det stämmer|stämmer|yes|yes correct|correct)[.! ]*$/i
+    .test(normalize(value));
+
+const isSwedish = (messages) => messages.some((m) =>
+  m.role === "user" &&
+  /[åäö]|\b(hej|jag|mitt|namn|heter|tack|vill|mejl|intresserad|ändra|eller|nej)\b/i.test(m.content));
+
+// One customer message + one model proposal -> new draft.
+// parsed = { name, email, service, clear: [...] } (anything else is ignored)
+function applyInterpretation(current, message, parsed, services = []) {
+  const draft = {
+    name: String(current?.name || ""),
+    email: String(current?.email || ""),
+    service: String(current?.service || ""),
+  };
+  const proposal = parsed && typeof parsed === "object" ? parsed : {};
+  const clearList = Array.isArray(proposal.clear)
+    ? proposal.clear.filter((field) => FIELDS.includes(field)) : [];
+  const accepted = [];
+  const rejected = [];
+  const cleared = [];
+  let changed = false;
+
+  for (const field of FIELDS) {
+    const raw = typeof proposal[field] === "string" ? proposal[field].trim() : "";
+    if (!raw) continue;
+    const value = field === "name" ? groundedName(message, raw)
+      : field === "email" ? groundedEmail(message, raw)
+      : canonicalService(raw, services);
+    if (value) {
+      if (draft[field] !== value) { draft[field] = value; changed = true; }
+      accepted.push(field);
+    } else if (normalize(raw) !== normalize(draft[field])) {
+      // Not usable and not just an echo of what we already have.
+      rejected.push(field);
     }
   }
-  if (allowPlainAnswer) {
-    const service = value.replace(/[.!?]+$/, "").trim();
-    if (service.length >= 2 && service.length <= 100 && !service.includes("@") &&
-        !/^(?:nej|ja|no|yes|vet inte|don't know)$/i.test(service)) return service;
+
+  for (const field of clearList) {
+    if (accepted.includes(field)) continue; // a new value in the same message wins
+    if (draft[field]) { draft[field] = ""; changed = true; cleared.push(field); }
   }
-  return "";
+
+  return { draft, changed, accepted, rejected, cleared };
+}
+
+module.exports = {
+  normalize, isValidEmail, isValidName, canonicalService, groundedName, groundedEmail,
+  nextMissingField, hasAllFields, isConfirmation, isSwedish, applyInterpretation,
 };
-const isConfirmation = (text) => /^(?:ja|ja det stämmer|ja, det stämmer|yes|yes correct|correct|stämmer|det stämmer)[.! ]*$/i.test(normalize(text));
-const hasAllFields = (draft) => Boolean(draft.name && draft.name.length >= 2 && isValidEmail(draft.email) && draft.service);
-const isSwedish = (messages) => messages.some(m => m.role === "user" && /[åäö]|\b(hej|jag|mitt|namn|heter|tack|vill|mejl|intresserad)\b/i.test(m.content));
-module.exports = { correctedService, bareCorrectedName, normalize, isValidEmail, emailFrom, customerSaid, explicitName, correctionField, isConfirmation, hasAllFields, isSwedish };

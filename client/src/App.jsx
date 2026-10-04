@@ -20,6 +20,27 @@ const getSessionId = () => {
 
 const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:5000").replace(/\/$/, "");
 
+const isTokenExpired = (token) => {
+  try {
+    const payload = token.split(".")[1];
+
+    if (!payload) return true;
+
+    const base64 = payload
+      .replace(/-/g, "+")
+      .replace(/_/g, "/")
+      .padEnd(Math.ceil(payload.length / 4) * 4, "=");
+
+    const decoded = JSON.parse(atob(base64));
+
+    if (!decoded.exp) return true;
+
+    return decoded.exp * 1000 < Date.now();
+  } catch {
+    return true;
+  }
+};
+
 function App() {
 
   const [sessionId, setSessionId] = useState(getSessionId);
@@ -434,28 +455,28 @@ function App() {
         </button>
 
         <button
+  onClick={() => {
+    setError("");
 
-          onClick={() => {
+    if (!token) {
+      setPage("dashboard");
+      return;
+    }
 
-            setError("");
+    if (isTokenExpired(token)) {
+      localStorage.removeItem("leadflow-token");
+      setToken("");
+      setLeads([]);
+      setPage("dashboard");
+      setError("Sessionen har gått ut. Logga in igen.");
+      return;
+    }
 
-            if (token) {
-
-              loadLeads();
-
-            } else {
-
-              setPage("dashboard");
-
-            }
-
-          }}
-
-        >
-
-          Dashboard
-
-        </button>
+    loadLeads();
+  }}
+>
+  Dashboard
+</button>
 
         {token && (
 
